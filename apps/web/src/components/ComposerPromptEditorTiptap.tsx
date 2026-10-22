@@ -4,6 +4,7 @@ import {
   Extension,
   findChildren,
   InputRule,
+  isiOS,
   Node,
   wrappingInputRule,
   type JSONContent,
@@ -1160,6 +1161,25 @@ function ComposerPromptEditorTiptapInner(
       editable: !disabled,
       editorProps: {
         attributes: editorAttributes,
+        handleDOMEvents: {
+          keydown: (view, event) => {
+            if (
+              !isiOS() ||
+              event.key !== "Enter" ||
+              !event.shiftKey ||
+              event.altKey ||
+              event.ctrlKey ||
+              event.metaKey ||
+              view.composing ||
+              event.isComposing ||
+              event.keyCode === 229
+            )
+              return false;
+            // ProseMirror's iOS Enter fallback synthesizes an unmodified keydown.
+            // Hardware Shift+Enter must reach the composer before Shift is lost.
+            return view.someProp("handleKeyDown", (handler) => handler(view, event)) ?? false;
+          },
+        },
         handleKeyDown: (view, event) => {
           // In a right-to-left line the start is on the right.
           const backArrow = caretLineDirection(view.state) === "rtl" ? "ArrowRight" : "ArrowLeft";
