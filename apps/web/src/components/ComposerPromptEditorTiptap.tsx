@@ -1165,6 +1165,7 @@ function ComposerPromptEditorTiptapInner(
           keydown: (view, event) => {
             if (
               !isiOS() ||
+              !view.editable ||
               event.key !== "Enter" ||
               !event.shiftKey ||
               event.altKey ||
@@ -1177,6 +1178,11 @@ function ComposerPromptEditorTiptapInner(
               return false;
             // ProseMirror's iOS Enter fallback synthesizes an unmodified keydown.
             // Hardware Shift+Enter must reach the composer before Shift is lost.
+            // Preserve the normal keydown path's pending-DOM safeguard.
+            // ProseMirror exposes its observer only as an internal property.
+            (
+              view as typeof view & { domObserver: { forceFlush(): void } }
+            ).domObserver.forceFlush();
             return view.someProp("handleKeyDown", (handler) => handler(view, event)) ?? false;
           },
         },

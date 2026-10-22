@@ -50,11 +50,21 @@ it.each([false, true])(
     if (!element) throw new Error("Composer did not mount");
     const editor = element.editor;
     await act(async () => {
-      editor.commands.setTextSelection(9);
+      editor.commands.setTextSelection(5);
       editor.view.focus();
     });
     using _timers = fakeTimers();
     await act(async () => {
+      // Model native text waiting for ProseMirror's deferred observer flush.
+      (
+        editor.view as typeof editor.view & { domObserver: { flushSoon(): void } }
+      ).domObserver.flushSoon();
+      const text = element.querySelector("p")?.firstChild;
+      if (!(text instanceof Text)) throw new Error("Composer text did not mount");
+      const replacement = document.createTextNode("line! one");
+      text.replaceWith(replacement);
+      window.getSelection()?.collapse(replacement, 5);
+      expect(serializeEditorDoc(editor.state.doc).value).toBe("line one");
       element.dispatchEvent(
         new KeyboardEvent("keydown", {
           key: "Enter",
@@ -73,7 +83,7 @@ it.each([false, true])(
       expect.objectContaining({ shiftKey: true }),
       false,
     );
-    expect(serializeEditorDoc(editor.state.doc).value).toBe("line one\n");
+    expect(serializeEditorDoc(editor.state.doc).value).toBe("line!\n one");
 
     commandKey.mockClear();
     await act(async () => {
@@ -95,7 +105,7 @@ it.each([false, true])(
       false,
     );
     expect(commandKey.mock.calls[0]?.[1].shiftKey).toBeFalsy();
-    expect(serializeEditorDoc(editor.state.doc).value).toBe("line one\n");
+    expect(serializeEditorDoc(editor.state.doc).value).toBe("line!\n one");
 
     commandKey.mockClear();
     submit.mockClear();
@@ -115,6 +125,55 @@ it.each([false, true])(
     });
     expect(commandKey).not.toHaveBeenCalled();
     expect(submit).not.toHaveBeenCalled();
-    expect(serializeEditorDoc(editor.state.doc).value).toBe("line one\n");
+    expect(serializeEditorDoc(editor.state.doc).value).toBe("line!\n one");
+  },
+);
+
+it.each([false, true])(
+  "leaves a disabled draft unchanged on hardware Shift+Enter (rich text: %s)",
+  async (richTextEnabled) => {
+    const commandKey = vi.fn(() => false);
+    const editorRef = createRef<ComposerPromptEditorHandle>();
+    const composer = (disabled: boolean) => (
+      <ComposerPromptEditor
+        editorRef={editorRef}
+        value="line one"
+        cursor={8}
+        richTextEnabled={richTextEnabled}
+        contextRecords={new Map()}
+        skills={[]}
+        disabled={disabled}
+        placeholder=""
+        onChange={() => {}}
+        onPaste={() => {}}
+        onCommandKeyDown={commandKey}
+      />
+    );
+    await using screen = await render(composer(false));
+    const element = screen.container.querySelector<HTMLElement & { editor: Editor }>(".tiptap");
+    if (!element) throw new Error("Composer did not mount");
+    const editor = element.editor;
+    await act(async () => {
+      editor.commands.setTextSelection(9);
+      editor.view.focus();
+    });
+    await screen.rerender(composer(true));
+    expect(editor.view.editable).toBe(false);
+    using _timers = fakeTimers();
+    await act(async () => {
+      element.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Enter",
+          code: "Enter",
+          keyCode: 13,
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(200);
+    });
+    expect(commandKey).not.toHaveBeenCalled();
+    expect(serializeEditorDoc(editor.state.doc).value).toBe("line one");
   },
 );
