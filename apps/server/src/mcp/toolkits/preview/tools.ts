@@ -1,4 +1,6 @@
 import {
+  PreviewAutomationPrivacyInput,
+  PreviewAutomationPrivacyResult,
   OrchestratorMcpFailure,
   ToolActivityIcon,
   PreviewAutomationClickInput,
@@ -82,6 +84,17 @@ const PreviewOpenTool = browserTool(
   })
     .annotate(Tool.Title, "Open browser preview")
     .annotate(Tool.Destructive, false),
+);
+
+const PreviewPrivacyTool = safeBrowserTool(
+  Tool.make("preview_privacy", {
+    description:
+      "Collect cookie metadata (including HttpOnly), storage keys and requests in your own fresh incognito tab. Open profileId:incognito at about:blank first, call action:start before navigating to the website, interact with consent through normal preview tools, then action:read after each state. Use a separate fresh tab per consent scenario. No cookie/storage values, headers or request bodies are returned. complete=false and limitations must remain explicit audit gaps.",
+    parameters: PreviewAutomationPrivacyInput,
+    success: PreviewAutomationPrivacyResult,
+    failure: PreviewToolFailure,
+    dependencies,
+  }).annotate(Tool.Title, "Read browser privacy evidence"),
 );
 
 const PreviewDialogTool = browserTool(
@@ -309,6 +322,7 @@ const PreviewRecordingStopTool = safeBrowserTool(
 );
 
 export const PreviewToolkit = Toolkit.make(
+  PreviewPrivacyTool,
   PreviewDialogTool,
   PreviewStatusTool,
   PreviewOpenTool,
@@ -331,6 +345,7 @@ export const PreviewToolkit = Toolkit.make(
 );
 
 export const PreviewStandardToolkit = Toolkit.make(
+  PreviewPrivacyTool,
   PreviewDialogTool,
   PreviewStatusTool,
   PreviewOpenTool,

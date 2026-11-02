@@ -25,6 +25,7 @@ import {
   type PreviewAutomationOpenInput,
   type PreviewAutomationPressInput,
   type PreviewAutomationRequest,
+  type PreviewAutomationPrivacyInput,
   type PreviewAutomationResizeInput,
   type PreviewAutomationScrollInput,
   type PreviewAutomationSelectInput,
@@ -78,6 +79,7 @@ import * as PreviewAutomationBroker from "../mcp/PreviewAutomationBroker.ts";
 import * as DesktopBrowserChannel from "./DesktopBrowserChannel.ts";
 import * as PreviewManager from "./Manager.ts";
 import * as ServerBrowserPage from "./ServerBrowserPage.ts";
+import { PrivacyEvidence } from "./PrivacyEvidence.ts";
 import * as PreviewBrowser from "./PreviewBrowser.ts";
 import * as PreviewBrowserHost from "./PreviewBrowserHost.ts";
 import { presentAsChrome, ServerBrowserContexts } from "./ServerBrowserContexts.ts";
@@ -1932,9 +1934,29 @@ const make = Effect.gen(function* () {
     );
   };
 
+  const privacyEvidence = new WeakMap<Page, PrivacyEvidence>();
+
   const executeTabOperation = async (tab: ServerTab, request: PreviewAutomationRequest) => {
     const input = request.input;
     switch (request.operation) {
+      case "privacy": {
+        const privacy = input as PreviewAutomationPrivacyInput;
+        let capture = privacyEvidence.get(tab.page);
+        if (privacy.action === "start") {
+          if (capture)
+            throw new Error(
+              "A privacy capture already exists for this tab; open a fresh incognito tab for another scenario.",
+            );
+          capture = await PrivacyEvidence.start(
+            tab.page,
+            tab.isolatedContext && tab.navigationGeneration === 0,
+          );
+          privacyEvidence.set(tab.page, capture);
+        }
+        if (!capture)
+          throw new Error("Start privacy capture in a fresh incognito tab before navigation.");
+        return capture.read();
+      }
       case "navigate": {
         const navigateInput = input as PreviewAutomationNavigateInput;
         await recordAction(tab, "navigate", () =>

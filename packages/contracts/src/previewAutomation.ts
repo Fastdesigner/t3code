@@ -54,6 +54,7 @@ export const PREVIEW_AUTOMATION_SERVER_OPERATIONS = [
   "hover",
   "select",
   "drag",
+  "privacy",
 ] as const;
 export const PreviewAutomationOperation = Schema.Literals(PREVIEW_AUTOMATION_SERVER_OPERATIONS);
 export type PreviewAutomationOperation = typeof PreviewAutomationOperation.Type;
@@ -1170,3 +1171,44 @@ export const PreviewUrlResolution = Schema.Struct({
   environmentId: EnvironmentId,
 });
 export type PreviewUrlResolution = typeof PreviewUrlResolution.Type;
+
+export const PreviewAutomationPrivacyInput = Schema.Struct({
+  ...PreviewAutomationTabTargetFields,
+  action: Schema.Literals(["start", "read"]),
+});
+export type PreviewAutomationPrivacyInput = typeof PreviewAutomationPrivacyInput.Type;
+export const PreviewAutomationPrivacyResult = Schema.Struct({
+  captureId: Schema.String,
+  startedAt: Schema.String,
+  capturedAt: Schema.String,
+  isolated: Schema.Boolean,
+  complete: Schema.Boolean,
+  limitations: Schema.Array(Schema.String),
+  cookies: Schema.Array(
+    Schema.Struct({
+      name: Schema.String,
+      domain: Schema.String,
+      path: Schema.String,
+      httpOnly: Schema.Boolean,
+      secure: Schema.Boolean,
+      sameSite: Schema.String,
+      expires: Schema.Number,
+    }),
+  ),
+  requests: Schema.Array(
+    Schema.Struct({
+      url: Schema.String,
+      method: Schema.String,
+      resourceType: Schema.String,
+      timestamp: Schema.String,
+    }),
+  ),
+  storage: Schema.Array(
+    Schema.Struct({
+      origin: Schema.String,
+      local: Schema.Array(Schema.String),
+      session: Schema.Array(Schema.String),
+    }),
+  ),
+});
+export type PreviewAutomationPrivacyResult = typeof PreviewAutomationPrivacyResult.Type;
