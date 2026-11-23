@@ -549,6 +549,10 @@ export const AuthMcpProtectedResourceMetadata = Schema.Struct({
 });
 export type AuthMcpProtectedResourceMetadata = typeof AuthMcpProtectedResourceMetadata.Type;
 
+/** A client that registers `refresh_token` gets a short access token and a rotating refresh token. */
+export const AuthMcpGrantType = Schema.Literals(["authorization_code", "refresh_token"]);
+export type AuthMcpGrantType = typeof AuthMcpGrantType.Type;
+
 export const AuthMcpAuthorizationServerMetadata = Schema.Struct({
   issuer: Schema.String,
   authorization_endpoint: Schema.String,
@@ -557,7 +561,7 @@ export const AuthMcpAuthorizationServerMetadata = Schema.Struct({
   // Older environments do not serve one.
   revocation_endpoint: Schema.optionalKey(Schema.String),
   response_types_supported: Schema.Array(Schema.Literal("code")),
-  grant_types_supported: Schema.Array(Schema.Literal("authorization_code")),
+  grant_types_supported: Schema.Array(AuthMcpGrantType),
   code_challenge_methods_supported: Schema.Array(Schema.Literal("S256")),
   token_endpoint_auth_methods_supported: Schema.Array(Schema.Literal("none")),
   scopes_supported: Schema.Array(AuthEnvironmentScope),
@@ -576,6 +580,7 @@ export const AuthMcpClientRegistration = Schema.Struct({
   client_name: Schema.optionalKey(Schema.String),
   software_id: Schema.optionalKey(Schema.String),
   redirect_uris: Schema.optionalKey(Schema.Array(Schema.String)),
+  grant_types: Schema.optionalKey(Schema.Array(Schema.String)),
   token_endpoint_auth_method: Schema.optionalKey(Schema.String),
 });
 export type AuthMcpClientRegistration = typeof AuthMcpClientRegistration.Type;
@@ -584,7 +589,7 @@ export const AuthMcpRegisteredClient = Schema.Struct({
   client_id: Schema.String,
   client_name: Schema.String,
   redirect_uris: Schema.Array(Schema.String),
-  grant_types: Schema.Array(Schema.Literal("authorization_code")),
+  grant_types: Schema.Array(AuthMcpGrantType),
   response_types: Schema.Array(Schema.Literal("code")),
   token_endpoint_auth_method: Schema.Literal("none"),
 }).pipe(HttpApiSchema.status(201));
@@ -668,11 +673,13 @@ export const AuthMcpTokenRequest = Schema.Struct({
   redirect_uri: Schema.optionalKey(Schema.String),
   client_id: Schema.optionalKey(Schema.String),
   code_verifier: Schema.optionalKey(Schema.RedactedFromValue(Schema.String)),
+  refresh_token: Schema.optionalKey(Schema.RedactedFromValue(Schema.String)),
+  scope: Schema.optionalKey(Schema.String),
   resource: Schema.optionalKey(Schema.String),
 }).pipe(HttpApiSchema.asFormUrlEncoded());
 export type AuthMcpTokenRequest = typeof AuthMcpTokenRequest.Type;
 
-/** RFC 7009: the holder of an access token ends its session. */
+/** RFC 7009: the holder of an access or refresh token ends its session. */
 export const AuthMcpRevokeRequest = Schema.Struct({
   token: Schema.optionalKey(Schema.RedactedFromValue(Schema.String)),
   token_type_hint: Schema.optionalKey(Schema.String),
@@ -684,6 +691,8 @@ export const AuthMcpTokenResult = Schema.Struct({
   token_type: Schema.Literal("Bearer"),
   expires_in: Schema.Number,
   scope: Schema.String,
+  /** Only for clients registered with the `refresh_token` grant. Each use replaces it. */
+  refresh_token: Schema.optionalKey(Schema.String),
 });
 export type AuthMcpTokenResult = typeof AuthMcpTokenResult.Type;
 
@@ -694,6 +703,8 @@ export class AuthMcpTokenError extends Schema.Error<AuthMcpTokenError>("AuthMcpT
       "invalid_client",
       "invalid_grant",
       "unsupported_grant_type",
+      "invalid_scope",
+      "invalid_target",
     ]),
     error_description: Schema.String,
   },

@@ -51,6 +51,15 @@ export interface IssuedSession {
   readonly expiresAt: DateTime.DateTime;
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
   readonly proofKeyThumbprint?: string;
+  /** Present when the session renews by refresh token; each refresh replaces it. */
+  readonly refreshToken?: string;
+}
+
+/** What a signed refresh token names, before its session is checked. */
+export interface RefreshTokenSubject {
+  readonly sessionId: AuthSessionId;
+  readonly subject: string;
+  readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
 }
 
 export interface VerifiedSession {
@@ -142,6 +151,17 @@ export class SessionTokenNotRenewableError extends Schema.TaggedError<SessionTok
 ) {
   override get message(): string {
     return "Session token cannot be renewed with this key.";
+  }
+}
+
+export class RefreshTokenReusedError extends Schema.TaggedError<RefreshTokenReusedError>()(
+  "RefreshTokenReusedError",
+  {
+    sessionId: AuthSessionId,
+  },
+) {
+  override get message(): string {
+    return "Refresh token was already used; its session is revoked.";
   }
 }
 
@@ -255,6 +275,7 @@ export const SessionCredentialInvalidError = Schema.Union([
   UnknownSessionTokenError,
   SessionTokenRevokedError,
   SessionTokenNotRenewableError,
+  RefreshTokenReusedError,
   InvalidSessionExpirationClaimError,
   MalformedWebSocketTokenError,
   InvalidWebSocketTokenSignatureError,
@@ -275,7 +296,11 @@ export class SessionClaimsEncodingError extends Schema.TaggedError<SessionClaims
   "SessionClaimsEncodingError",
   {
     sessionId: AuthSessionId,
-    operation: Schema.Literals(["encode_session_claims", "encode_websocket_claims"]),
+    operation: Schema.Literals([
+      "encode_session_claims",
+      "encode_websocket_claims",
+      "encode_refresh_claims",
+    ]),
     ...sessionCredentialInternalErrorContext,
   },
 ) {
@@ -416,6 +441,11 @@ export class SessionStore extends Context.Service<
       readonly replaceSessionId?: AuthSessionId;
       /** Keeps the session alive this long past each renewal; `ttl` then bounds only the token. */
       readonly renewalWindow?: Duration.Duration;
+      /**
+       * Also issues a rotating refresh token, valid only with this binding. Needs `renewalWindow`,
+       * which then bounds how long the session may sit unrefreshed.
+       */
+      readonly refreshBinding?: string;
     }) => Effect.Effect<IssuedSession, SessionCredentialInternalError>;
     /** Trades a renewable token, even an expired one, for a fresh token on the same session. */
     readonly renew: (
@@ -433,6 +463,22 @@ export class SessionStore extends Context.Service<
       IssuedSession,
       SessionCredentialError | ServerAuthInvalidCredentialError | ServerAuthInternalError
     >;
+    /**
+     * Spends a refresh token for a new access token and refresh token on the same session. Every
+     * token is good once: a spent one presented again revokes the session (RFC 9700 §4.14.2).
+     */
+    readonly refresh: (
+      refreshToken: string,
+      input: {
+        readonly binding: string;
+        readonly ttl: Duration.Duration;
+        readonly renewalWindow: Duration.Duration;
+      },
+    ) => Effect.Effect<IssuedSession, SessionCredentialError>;
+    /** The session a correctly signed refresh token names, whatever that session's state. */
+    readonly readRefreshToken: (
+      refreshToken: string,
+    ) => Effect.Effect<Option.Option<RefreshTokenSubject>>;
     readonly verify: (token: string) => Effect.Effect<VerifiedSession, SessionCredentialError>;
     /**
      * Moves a live session's expiry to `expiresAt` unless it is already within `step` of it, and
@@ -521,8 +567,26 @@ const WebSocketClaims = Schema.Struct({
 });
 type WebSocketClaims = typeof WebSocketClaims.Type;
 
+/** A refresh token carries what its access tokens are signed with, so a refresh grants no more. */
+const RefreshClaims = Schema.Struct({
+  v: Schema.Literal(1),
+  kind: Schema.Literal("refresh"),
+  sid: AuthSessionId,
+  /** The session's refresh generation this token spends. */
+  gen: Schema.Int,
+  /** Who may present it, such as one OAuth client for one resource. */
+  bnd: Schema.String,
+  sub: Schema.String,
+  scopes: AuthEnvironmentScopes,
+  method: Schema.Literal("bearer-access-token"),
+  rtc: Schema.optionalKey(RuntimeMode),
+  iat: Schema.Number,
+});
+type RefreshClaims = typeof RefreshClaims.Type;
+
 const decodeSessionClaims = Schema.decodeUnknownEffect(Schema.fromJsonString(SessionClaims));
 const decodeWebSocketClaims = Schema.decodeUnknownEffect(Schema.fromJsonString(WebSocketClaims));
+const decodeRefreshClaims = Schema.decodeUnknownOption(Schema.fromJsonString(RefreshClaims));
 
 function createDefaultClientMetadata(): AuthClientMetadata {
   return {
@@ -724,6 +788,25 @@ const make = Effect.gen(function* () {
     );
     return `${encodedPayload}.${yield* signer.sign(encodedPayload)}`;
   });
+  const encodeRefreshClaims = Schema.encodeEffect(Schema.fromJsonString(RefreshClaims));
+  const signRefreshClaims = Effect.fnUntraced(function* (claims: RefreshClaims) {
+    const encodedPayload = yield* encodeRefreshClaims(claims).pipe(
+      Effect.map(base64UrlEncode),
+      Effect.mapError(
+        (cause) =>
+          new SessionCredentialIssueError({
+            sessionId: claims.sid,
+            cause: new SessionClaimsEncodingError({
+              sessionId: claims.sid,
+              operation: "encode_refresh_claims",
+              cause,
+            }),
+          }),
+      ),
+    );
+    return `${encodedPayload}.${yield* signer.sign(encodedPayload)}`;
+  });
+
   const issue: SessionStore["Service"]["issue"] = Effect.fn("SessionStore.issue")(
     function* (input) {
       const sessionId = AuthSessionId.make(
@@ -771,6 +854,9 @@ const make = Effect.gen(function* () {
         issuedAt,
         expiresAt: sessionExpiresAt,
         ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
+        ...(input?.refreshBinding !== undefined && claims.method === "bearer-access-token"
+          ? { refreshGeneration: 0 }
+          : {}),
       } satisfies AuthSessions.CreateAuthSessionInput;
       const replacedSessionIds = yield* (
         input?.replaceSessionId !== undefined || input?.replaceActiveForSubjectAndMethod
@@ -811,6 +897,22 @@ const make = Effect.gen(function* () {
         }),
       );
 
+      // DPoP sessions renew through their key, and cookies never leave the browser.
+      const refreshToken =
+        input?.refreshBinding === undefined || claims.method !== "bearer-access-token"
+          ? undefined
+          : yield* signRefreshClaims({
+              v: 1,
+              kind: "refresh",
+              sid: sessionId,
+              gen: 0,
+              bnd: input.refreshBinding,
+              sub: claims.sub,
+              scopes: claims.scopes,
+              method: claims.method,
+              ...(claims.rtc ? { rtc: claims.rtc } : {}),
+              iat: claims.iat,
+            });
       return {
         sessionId,
         token,
@@ -819,6 +921,7 @@ const make = Effect.gen(function* () {
         expiresAt: expiresAt,
         scopes: claims.scopes,
         ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
+        ...(refreshToken === undefined ? {} : { refreshToken }),
       } satisfies IssuedSession;
     },
   );
@@ -1202,6 +1305,123 @@ const make = Effect.gen(function* () {
     },
   );
 
+  const parseRefreshClaims = (refreshToken: string) => {
+    const [encodedPayload, signature, extra] = refreshToken.split(".");
+    if (!encodedPayload || !signature || extra !== undefined) return Effect.succeedNone;
+    return signer
+      .verify(encodedPayload, signature)
+      .pipe(
+        Effect.map((verified) =>
+          verified
+            ? Option.flatMap(
+                Option.liftThrowable(base64UrlDecodeUtf8)(encodedPayload),
+                decodeRefreshClaims,
+              )
+            : Option.none(),
+        ),
+      );
+  };
+
+  const readRefreshToken: SessionStore["Service"]["readRefreshToken"] = (refreshToken) =>
+    parseRefreshClaims(refreshToken).pipe(
+      Effect.map(
+        Option.map((claims) => ({
+          sessionId: claims.sid,
+          subject: claims.sub,
+          scopes: claims.scopes,
+        })),
+      ),
+    );
+
+  const refresh: SessionStore["Service"]["refresh"] = Effect.fn("SessionStore.refresh")(
+    function* (refreshToken, input) {
+      const parsed = yield* parseRefreshClaims(refreshToken);
+      if (Option.isNone(parsed)) return yield* new MalformedSessionTokenError({});
+      const claims = parsed.value;
+      if (claims.bnd !== input.binding) {
+        return yield* new SessionTokenNotRenewableError({ sessionId: claims.sid });
+      }
+      const now = yield* DateTime.now;
+      const rotated = yield* authSessions
+        .rotateRefresh({
+          sessionId: claims.sid,
+          generation: claims.gen,
+          expiresAt: DateTime.add(now, { milliseconds: Duration.toMillis(input.renewalWindow) }),
+          now,
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) => new SessionCredentialVerificationError({ sessionId: claims.sid, cause }),
+          ),
+        );
+      const row = yield* authSessions
+        .getById({ sessionId: claims.sid })
+        .pipe(
+          Effect.mapError(
+            (cause) => new SessionCredentialVerificationError({ sessionId: claims.sid, cause }),
+          ),
+        );
+      if (Option.isNone(row)) {
+        return yield* new UnknownSessionTokenError({ sessionId: claims.sid });
+      }
+      if (!rotated) {
+        if (row.value.revokedAt !== null) {
+          return yield* new SessionTokenRevokedError({
+            sessionId: claims.sid,
+            revokedAt: row.value.revokedAt,
+          });
+        }
+        if (row.value.expiresAt.epochMilliseconds <= now.epochMilliseconds) {
+          return yield* new SessionTokenExpiredError({
+            sessionId: claims.sid,
+            expiresAt: row.value.expiresAt,
+            observedAt: now,
+          });
+        }
+        // The session is live but moved past this token, so someone used it before: a thief or
+        // the client. Either way neither keeps the session.
+        yield* revoke(claims.sid).pipe(
+          Effect.mapError(
+            (cause) => new SessionCredentialVerificationError({ sessionId: claims.sid, cause }),
+          ),
+        );
+        return yield* new RefreshTokenReusedError({ sessionId: claims.sid });
+      }
+      const expiresAt = DateTime.add(now, { milliseconds: Duration.toMillis(input.ttl) });
+      const token = yield* signClaims({
+        v: 1,
+        kind: "session",
+        sid: claims.sid,
+        sub: claims.sub,
+        scopes: claims.scopes,
+        method: claims.method,
+        ...(claims.rtc ? { rtc: claims.rtc } : {}),
+        iat: now.epochMilliseconds,
+        exp: expiresAt.epochMilliseconds,
+      });
+      const nextRefreshToken = yield* signRefreshClaims({
+        ...claims,
+        gen: claims.gen + 1,
+        iat: now.epochMilliseconds,
+      });
+      const session = yield* loadActiveSession(claims.sid).pipe(
+        Effect.mapError(
+          (cause) => new SessionCredentialVerificationError({ sessionId: claims.sid, cause }),
+        ),
+      );
+      if (Option.isSome(session)) yield* emitUpsert(session.value);
+      return {
+        sessionId: claims.sid,
+        token,
+        method: claims.method,
+        client: toClientMetadata(row.value.client),
+        expiresAt,
+        scopes: row.value.scopes,
+        refreshToken: nextRefreshToken,
+      } satisfies IssuedSession;
+    },
+  );
+
   const proofKeyThumbprintOf: SessionStore["Service"]["proofKeyThumbprintOf"] = (sessionId) =>
     authSessions
       .getProofKeyThumbprint({ sessionId })
@@ -1343,6 +1563,8 @@ const make = Effect.gen(function* () {
     legacyCookieName,
     issue,
     renew,
+    refresh,
+    readRefreshToken,
     extend,
     verify,
     issueWebSocketToken,

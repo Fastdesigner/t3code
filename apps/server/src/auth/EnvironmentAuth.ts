@@ -84,6 +84,8 @@ export interface IssuedBearerSession {
 
 // MCP client tokens are restricted to /mcp; HTTP API and WebSocket RPC would bypass their access cap.
 const MCP_CLIENT_SUBJECT = "mcp-client";
+// Clients without the refresh_token grant keep one long-lived token; refreshing clients get the
+// renewable lifetimes below, so a client idle past the window signs in again.
 const MCP_CLIENT_SESSION_TTL = Duration.days(30);
 // A peer link's session moves back out to its full lifetime when a call finds it this far
 // short, so a used link never expires and a busy one writes at most once per step.
@@ -483,6 +485,26 @@ export class ServerAuthMcpApprovalCodeError extends Schema.TaggedError<ServerAut
   }
 }
 
+/** A refresh the token endpoint answers with `error` (RFC 6749 §5.2). */
+export class ServerAuthMcpRefreshError extends Schema.TaggedError<ServerAuthMcpRefreshError>()(
+  "ServerAuthMcpRefreshError",
+  { error: Schema.Literals(["invalid_grant", "invalid_scope"]) },
+) {
+  override get message(): string {
+    return this.error === "invalid_scope"
+      ? "A refresh keeps the scopes the client was approved for."
+      : "The refresh token is invalid, expired, revoked or already used.";
+  }
+}
+
+export interface IssuedMcpClientSession {
+  readonly sessionId: AuthSessionId;
+  readonly token: string;
+  readonly expiresAt: DateTime.DateTime;
+  /** Present for a client that renews by refresh token. */
+  readonly refreshToken?: string;
+}
+
 export class ServerAuthForbiddenOperationError extends Schema.TaggedError<ServerAuthForbiddenOperationError>()(
   "ServerAuthForbiddenOperationError",
   {},
@@ -635,7 +657,10 @@ export class EnvironmentAuth extends Context.Service<
     readonly authenticateMcpClient: (
       request: HttpServerRequest.HttpServerRequest,
     ) => Effect.Effect<McpClientSession, ServerAuthCredentialError | ServerAuthInternalError>;
-    /** Ends the MCP client session `token` belongs to. False when it is no live MCP client token. */
+    /**
+     * Ends the MCP client session an access or refresh `token` belongs to. False when it is no
+     * live MCP client token.
+     */
     readonly revokeMcpClientToken: (
       token: string,
     ) => Effect.Effect<boolean, ServerAuthInternalError>;
@@ -644,13 +669,21 @@ export class EnvironmentAuth extends Context.Service<
       readonly access: AuthMcpClientAccess;
       readonly peerLink: boolean;
       readonly client: AuthClientMetadata;
+      /** Issues a short access token and a refresh token only this binding may present. */
+      readonly refreshBinding?: string;
+    }) => Effect.Effect<IssuedMcpClientSession, ServerAuthInternalError>;
+    /**
+     * Trades a refresh token for a new access and refresh token with the same scopes and
+     * runtime-mode ceiling. A spent refresh token presented again revokes its session.
+     */
+    readonly refreshMcpClientSession: (input: {
+      readonly refreshToken: string;
+      readonly binding: string;
+      /** The client's `scope` parameter, if it sent one. */
+      readonly requestedScopes?: ReadonlyArray<string>;
     }) => Effect.Effect<
-      {
-        readonly sessionId: AuthSessionId;
-        readonly token: string;
-        readonly expiresAt: DateTime.DateTime;
-      },
-      ServerAuthInternalError
+      IssuedMcpClientSession & { readonly scopes: ReadonlyArray<AuthEnvironmentScope> },
+      ServerAuthMcpRefreshError | ServerAuthInternalError
     >;
     /**
      * Spends a code covering all granted scopes and returns the level it approves. A level-bound
@@ -1649,36 +1682,91 @@ export const make = Effect.gen(function* () {
       Effect.catchIf(SessionStore.isSessionCredentialInvalidError, () => Effect.succeedNone),
       Effect.mapError((cause) => new ServerAuthSessionCredentialValidationError({ cause })),
     );
-    if (
-      Option.isNone(session) ||
-      session.value.subject !== MCP_CLIENT_SUBJECT ||
-      session.value.method !== "bearer-access-token"
-    ) {
-      return false;
+    if (Option.isSome(session)) {
+      return session.value.subject === MCP_CLIENT_SUBJECT &&
+        session.value.method === "bearer-access-token"
+        ? yield* revokeSession(session.value.sessionId)
+        : false;
     }
-    return yield* revokeSession(session.value.sessionId);
+    const refreshing = yield* sessions.readRefreshToken(token);
+    return Option.isSome(refreshing) && refreshing.value.subject === MCP_CLIENT_SUBJECT
+      ? yield* revokeSession(refreshing.value.sessionId)
+      : false;
   });
 
-  const issueMcpClientSession: EnvironmentAuth["Service"]["issueMcpClientSession"] = (input) =>
-    sessions
+  const toIssuedMcpClientSession = (
+    issued: SessionStore.IssuedSession,
+  ): IssuedMcpClientSession => ({
+    sessionId: issued.sessionId,
+    token: issued.token,
+    expiresAt: issued.expiresAt,
+    ...(issued.refreshToken === undefined ? {} : { refreshToken: issued.refreshToken }),
+  });
+
+  const issueMcpClientSession: EnvironmentAuth["Service"]["issueMcpClientSession"] = (input) => {
+    // A peer link's session already renews while it is used.
+    const refreshBinding = input.peerLink ? undefined : input.refreshBinding;
+    return sessions
       .issue({
         subject: MCP_CLIENT_SUBJECT,
         method: "bearer-access-token",
         scopes: mcpClientScopes(input.access),
-        ttl: MCP_CLIENT_SESSION_TTL,
+        ...(refreshBinding === undefined
+          ? { ttl: MCP_CLIENT_SESSION_TTL }
+          : {
+              ttl: RENEWABLE_ACCESS_TOKEN_TTL,
+              renewalWindow: RENEWABLE_SESSION_WINDOW,
+              refreshBinding,
+            }),
         ...(input.access === "read-only" ? {} : { runtimeModeCeiling: input.access }),
         peerLink: input.peerLink,
         client: { ...input.client, label: input.label, deviceType: "bot" },
       })
       .pipe(
-        Effect.map((issued) => ({
-          sessionId: issued.sessionId,
-          token: issued.token,
-          expiresAt: issued.expiresAt,
-        })),
+        Effect.map(toIssuedMcpClientSession),
         Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })),
         Effect.withSpan("EnvironmentAuth.issueMcpClientSession"),
       );
+  };
+
+  const refreshMcpClientSession: EnvironmentAuth["Service"]["refreshMcpClientSession"] = Effect.fn(
+    "EnvironmentAuth.refreshMcpClientSession",
+  )(function* (input) {
+    const named = yield* sessions.readRefreshToken(input.refreshToken);
+    if (Option.isNone(named) || named.value.subject !== MCP_CLIENT_SUBJECT) {
+      return yield* new ServerAuthMcpRefreshError({ error: "invalid_grant" });
+    }
+    const granted = named.value.scopes;
+    // Rejected before the token is spent, so the client can retry without `scope`.
+    if (
+      input.requestedScopes !== undefined &&
+      (new Set(input.requestedScopes).size !== granted.length ||
+        !input.requestedScopes.every((scope) => granted.some((held) => held === scope)))
+    ) {
+      return yield* new ServerAuthMcpRefreshError({ error: "invalid_scope" });
+    }
+    const issued = yield* sessions
+      .refresh(input.refreshToken, {
+        binding: input.binding,
+        ttl: RENEWABLE_ACCESS_TOKEN_TTL,
+        renewalWindow: RENEWABLE_SESSION_WINDOW,
+      })
+      .pipe(
+        Effect.tapError((cause) =>
+          cause._tag === "RefreshTokenReusedError"
+            ? Effect.logWarning("Revoked an MCP client session whose refresh token was reused.", {
+                sessionId: cause.sessionId,
+              })
+            : Effect.void,
+        ),
+        Effect.mapError((cause) =>
+          SessionStore.isSessionCredentialInvalidError(cause)
+            ? new ServerAuthMcpRefreshError({ error: "invalid_grant" })
+            : new ServerAuthSessionCredentialValidationError({ cause }),
+        ),
+      );
+    return { ...toIssuedMcpClientSession(issued), scopes: issued.scopes };
+  });
 
   const consumeMcpApprovalCode: EnvironmentAuth["Service"]["consumeMcpApprovalCode"] = (
     code,
@@ -1743,6 +1831,7 @@ export const make = Effect.gen(function* () {
     authenticateMcpClient,
     revokeMcpClientToken,
     issueMcpClientSession,
+    refreshMcpClientSession,
     consumeMcpApprovalCode,
   });
 });

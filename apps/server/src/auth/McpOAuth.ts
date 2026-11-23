@@ -19,7 +19,7 @@ import {
   type RuntimeMode,
 } from "@t3tools/contracts";
 import { DEFAULT_HOSTED_APP_URL } from "@t3tools/shared/connectAuth";
-import { encodeOAuthScope } from "@t3tools/shared/oauthScope";
+import { encodeOAuthScope, parseOAuthScope } from "@t3tools/shared/oauthScope";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
@@ -99,7 +99,7 @@ export const authorizationServerMetadata = (
   registration_endpoint: `${urls.issuer}/oauth/mcp/register`,
   revocation_endpoint: `${urls.issuer}/oauth/mcp/revoke`,
   response_types_supported: ["code"],
-  grant_types_supported: ["authorization_code"],
+  grant_types_supported: ["authorization_code", "refresh_token"],
   code_challenge_methods_supported: ["S256"],
   token_endpoint_auth_methods_supported: ["none"],
   scopes_supported: MCP_OAUTH_SCOPES,
@@ -151,6 +151,8 @@ const ClientIdPayload = Schema.Struct({
   r: Schema.Array(Schema.String),
   /** Registered as another T3 Code environment's peer link. */
   p: Schema.optionalKey(Schema.Literal(1)),
+  /** Registered the refresh_token grant. Older client IDs keep their long-lived token. */
+  g: Schema.optionalKey(Schema.Literal(1)),
 });
 const decodeClientIdPayload = Schema.decodeUnknownOption(Schema.fromJsonString(ClientIdPayload));
 
@@ -159,6 +161,7 @@ export interface McpOAuthClient {
   readonly name: string;
   readonly redirectUris: ReadonlyArray<string>;
   readonly peerLink: boolean;
+  readonly refreshable: boolean;
 }
 
 export class McpOAuthPageError extends Schema.TaggedError<McpOAuthPageError>()(
@@ -193,6 +196,7 @@ interface PendingCode {
   readonly clientId: string;
   readonly clientName: string;
   readonly peerLink: boolean;
+  readonly refreshable: boolean;
   readonly redirectUri: string;
   readonly codeChallenge: string;
   readonly resource: string;
@@ -277,9 +281,20 @@ const make = Effect.gen(function* () {
 
   const sign = (domain: string, payload: string) => signer.sign(`${domain}.${payload}`);
 
-  const signClientId = (name: string, redirectUris: ReadonlyArray<string>, peerLink: boolean) => {
+  const signClientId = (
+    name: string,
+    redirectUris: ReadonlyArray<string>,
+    peerLink: boolean,
+    refreshable: boolean,
+  ) => {
     const body = base64UrlEncode(
-      JSON.stringify({ v: 1, n: name, r: redirectUris, ...(peerLink ? { p: 1 } : {}) }),
+      JSON.stringify({
+        v: 1,
+        n: name,
+        r: redirectUris,
+        ...(peerLink ? { p: 1 } : {}),
+        ...(refreshable ? { g: 1 } : {}),
+      }),
     );
     return sign("mcp-client-id", body).pipe(Effect.map((signature) => `${body}.${signature}`));
   };
@@ -301,6 +316,7 @@ const make = Effect.gen(function* () {
           name: payload.n,
           redirectUris: payload.r,
           peerLink: payload.p === 1,
+          refreshable: payload.g === 1,
         })),
       ),
     );
@@ -355,7 +371,9 @@ const make = Effect.gen(function* () {
             'Linked environments is off on that machine. Turn it on in its Settings → Labs, or without a desktop, set "linkedEnvironmentsEnabled": true in userdata/settings.json in its T3 home (~/.t3 by default).',
         });
       }
-      const clientId = yield* signClientId(name, redirectUris, peerLink);
+      // A peer link's session already renews while it is used.
+      const refreshable = !peerLink && (metadata.grant_types ?? []).includes("refresh_token");
+      const clientId = yield* signClientId(name, redirectUris, peerLink, refreshable);
       if (
         redirectUris.length > MAX_UNBOUNDED_CLIENT_ID_REDIRECT_URIS &&
         clientId.length > MAX_CLIENT_ID_LENGTH
@@ -370,6 +388,7 @@ const make = Effect.gen(function* () {
         name,
         redirectUris,
         peerLink,
+        refreshable,
       };
     },
   );
@@ -454,6 +473,7 @@ const make = Effect.gen(function* () {
         clientId: authorization.client.clientId,
         clientName: authorization.client.name,
         peerLink: authorization.client.peerLink,
+        refreshable: authorization.client.refreshable,
         redirectUri: authorization.redirectUri,
         codeChallenge: authorization.codeChallenge,
         resource: authorization.resource,
@@ -522,12 +542,83 @@ const make = Effect.gen(function* () {
       iss: authorization.issuer,
     });
 
+  /** Ties a refresh token to the client and the resource it was issued for (RFC 8707 §2.2). */
+  const refreshBinding = (clientId: string, resource: string) =>
+    digester
+      .digest(Digest.sha256, new TextEncoder().encode(`${clientId}\n${resource}`))
+      .pipe(Effect.orDie, Effect.map(base64UrlEncode));
+
+  const tokenResult = (
+    issued: EnvironmentAuth.IssuedMcpClientSession,
+    scopes: ReadonlyArray<string>,
+    now: number,
+  ): AuthMcpTokenResult => ({
+    access_token: issued.token,
+    token_type: "Bearer",
+    expires_in: Math.max(0, Math.floor((issued.expiresAt.epochMilliseconds - now) / 1000)),
+    scope: encodeOAuthScope(scopes),
+    ...(issued.refreshToken === undefined ? {} : { refresh_token: issued.refreshToken }),
+  });
+
+  const refreshToken = Effect.fn("McpOAuth.refreshToken")(function* ({
+    urls,
+    token,
+  }: {
+    readonly urls: McpOAuthUrls;
+    readonly token: AuthMcpTokenRequest;
+  }) {
+    const fail = (error: AuthMcpTokenError["error"], description: string) =>
+      new AuthMcpTokenError({ error, error_description: description });
+    const presented = token.refresh_token && Redacted.value(token.refresh_token);
+    const clientId = token.client_id;
+    if (!presented || !clientId) {
+      return yield* fail("invalid_request", "refresh_token and client_id are required.");
+    }
+    const client = yield* parseClientId(clientId);
+    if (client === undefined || !client.refreshable) {
+      return yield* fail(
+        "invalid_client",
+        "The client is unknown or did not register refresh_token.",
+      );
+    }
+    if (!sameResource(urls, token.resource)) {
+      return yield* fail("invalid_target", `This server only issues tokens for ${urls.resource}.`);
+    }
+    const requestedScopes = token.scope === undefined ? undefined : parseOAuthScope(token.scope);
+    if (requestedScopes === null) {
+      return yield* fail("invalid_scope", "The scope parameter is malformed.");
+    }
+    const issued = yield* environmentAuth
+      .refreshMcpClientSession({
+        refreshToken: presented,
+        binding: yield* refreshBinding(clientId, urls.resource),
+        ...(requestedScopes === undefined ? {} : { requestedScopes }),
+      })
+      .pipe(
+        Effect.catchTags({
+          ServerAuthMcpRefreshError: (error) => Effect.fail(fail(error.error, error.message)),
+        }),
+        Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (cause) =>
+          Effect.logError("Could not refresh an MCP client session.", { cause }).pipe(
+            Effect.andThen(Effect.fail(fail("invalid_grant", "The session could not be renewed."))),
+          ),
+        ),
+      );
+    return tokenResult(issued, issued.scopes, yield* Clock.currentTimeMillis);
+  });
+
   const exchangeCode: McpOAuth["Service"]["exchangeCode"] = Effect.fn("McpOAuth.exchangeCode")(
     function* ({ request, urls, token }) {
       const fail = (error: AuthMcpTokenError["error"], description: string) =>
         new AuthMcpTokenError({ error, error_description: description });
+      if (token.grant_type === "refresh_token") {
+        return yield* refreshToken({ urls, token });
+      }
       if (token.grant_type !== "authorization_code") {
-        return yield* fail("unsupported_grant_type", "Only authorization_code is supported.");
+        return yield* fail(
+          "unsupported_grant_type",
+          "Only authorization_code and refresh_token are supported.",
+        );
       }
       const { redirect_uri: redirectUri, client_id: clientId } = token;
       const code = token.code && Redacted.value(token.code);
@@ -567,6 +658,9 @@ const make = Effect.gen(function* () {
           access: pending.access,
           peerLink: pending.peerLink,
           client: deriveAuthClientMetadata({ request }),
+          ...(pending.refreshable
+            ? { refreshBinding: yield* refreshBinding(clientId, pending.resource) }
+            : {}),
         })
         .pipe(
           Effect.catch((cause) =>
@@ -577,12 +671,7 @@ const make = Effect.gen(function* () {
             ),
           ),
         );
-      return {
-        access_token: issued.token,
-        token_type: "Bearer",
-        expires_in: Math.max(0, Math.floor((issued.expiresAt.epochMilliseconds - now) / 1000)),
-        scope: encodeOAuthScope(mcpClientScopes(pending.access)),
-      };
+      return tokenResult(issued, mcpClientScopes(pending.access), now);
     },
   );
 

@@ -53,6 +53,8 @@ export const CreateAuthSessionInput = Schema.Struct({
   issuedAt: Schema.DateTimeUtcFromString,
   expiresAt: Schema.DateTimeUtcFromString,
   proofKeyThumbprint: Schema.optionalKey(Schema.String),
+  /** Set to 0 for a session that renews by refresh token. */
+  refreshGeneration: Schema.optionalKey(Schema.Number),
 });
 export type CreateAuthSessionInput = typeof CreateAuthSessionInput.Type;
 
@@ -89,6 +91,14 @@ export const ExtendAuthSessionInput = Schema.Struct({
   onlyIfExpiresBy: Schema.optional(Schema.DateTimeUtcFromString),
 });
 export type ExtendAuthSessionInput = typeof ExtendAuthSessionInput.Type;
+
+export const RotateAuthSessionRefreshInput = Schema.Struct({
+  sessionId: AuthSessionId,
+  generation: Schema.Number,
+  expiresAt: Schema.DateTimeUtcFromString,
+  now: Schema.DateTimeUtcFromString,
+});
+export type RotateAuthSessionRefreshInput = typeof RotateAuthSessionRefreshInput.Type;
 
 export const RevokeOtherAuthSessionsInput = Schema.Struct({
   currentSessionId: AuthSessionId,
@@ -132,6 +142,13 @@ export class AuthSessionRepository extends Context.Service<
     /** Moves a live session's expiry; false when it is revoked, expired, missing or past `onlyIfExpiresBy`. */
     readonly extend: (
       input: ExtendAuthSessionInput,
+    ) => Effect.Effect<boolean, AuthSessionRepositoryError>;
+    /**
+     * Moves a live session from refresh `generation` to the next and its expiry to `expiresAt`.
+     * False when it is revoked, expired, missing or already past that generation.
+     */
+    readonly rotateRefresh: (
+      input: RotateAuthSessionRefreshInput,
     ) => Effect.Effect<boolean, AuthSessionRepositoryError>;
     readonly revokeAllExcept: (
       input: RevokeOtherAuthSessionsInput,
@@ -243,7 +260,8 @@ export const make = Effect.gen(function* () {
           issued_at,
           expires_at,
           revoked_at,
-          proof_key_thumbprint
+          proof_key_thumbprint,
+          refresh_generation
         )
         VALUES (
           ${input.sessionId},
@@ -259,7 +277,8 @@ export const make = Effect.gen(function* () {
           ${input.issuedAt},
           ${input.expiresAt},
           NULL,
-          ${input.proofKeyThumbprint ?? null}
+          ${input.proofKeyThumbprint ?? null},
+          ${input.refreshGeneration ?? null}
         )
         ${ignoreExisting ? sql`ON CONFLICT(session_id) DO NOTHING` : sql``}
       `,
@@ -373,6 +392,23 @@ export const make = Effect.gen(function* () {
           AND revoked_at IS NULL
           AND expires_at > ${now}
           AND (${onlyIfExpiresBy ?? null} IS NULL OR expires_at <= ${onlyIfExpiresBy ?? null})
+        RETURNING session_id AS "sessionId"
+      `,
+  });
+
+  const rotateRefreshRows = SqlSchema.findAll({
+    Request: RotateAuthSessionRefreshInput,
+    Result: Schema.Struct({ sessionId: AuthSessionId }),
+    // One statement, so of two refreshes presenting the same generation exactly one moves it.
+    execute: ({ sessionId, generation, expiresAt, now }) =>
+      sql`
+        UPDATE auth_sessions
+        SET refresh_generation = refresh_generation + 1,
+          expires_at = ${expiresAt}
+        WHERE session_id = ${sessionId}
+          AND refresh_generation = ${generation}
+          AND revoked_at IS NULL
+          AND expires_at > ${now}
         RETURNING session_id AS "sessionId"
       `,
   });
@@ -537,6 +573,18 @@ export const make = Effect.gen(function* () {
       Effect.map((rows) => rows.length > 0),
     );
 
+  const rotateRefresh: AuthSessionRepository["Service"]["rotateRefresh"] = (input) =>
+    rotateRefreshRows(input).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "AuthSessionRepository.rotateRefresh:query",
+          "AuthSessionRepository.rotateRefresh:decodeRows",
+          { sessionId: input.sessionId },
+        ),
+      ),
+      Effect.map((rows) => rows.length > 0),
+    );
+
   const revokeAllExcept: AuthSessionRepository["Service"]["revokeAllExcept"] = (input) =>
     revokeOtherSessionRows(input).pipe(
       Effect.mapError(
@@ -594,6 +642,7 @@ export const make = Effect.gen(function* () {
     listActive,
     revoke,
     extend,
+    rotateRefresh,
     revokeAllExcept,
     setLastConnectedAt,
     getProofKeyThumbprint,
