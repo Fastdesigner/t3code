@@ -125,7 +125,9 @@ export const layer = HttpApiBuilder.group(
             client_id: client.clientId,
             client_name: client.name,
             redirect_uris: client.redirectUris,
-            grant_types: ["authorization_code" as const],
+            grant_types: client.refreshable
+              ? (["authorization_code", "refresh_token"] as const)
+              : (["authorization_code"] as const),
             response_types: ["code" as const],
             token_endpoint_auth_method: "none" as const,
           })),

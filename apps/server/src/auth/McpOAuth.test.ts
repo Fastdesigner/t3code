@@ -910,3 +910,214 @@ it("matches loopback redirects on everything but the port, and https redirects e
   expect(matches("https://bot.example/cb", "https://bot.example/cb?x=1")).toBe(false);
   expect(matches("https://bot.example/cb", "https://evil.example/cb")).toBe(false);
 });
+
+interface TokenResponse {
+  readonly status: number;
+  readonly access_token?: string;
+  readonly refresh_token?: string;
+  readonly expires_in?: number;
+  readonly scope?: string;
+  readonly error?: string;
+}
+
+const tokenRequest = (handler: Handler, body: Record<string, string>, request = at) =>
+  handler(request("/oauth/mcp/token", form(body))).pipe(
+    Effect.flatMap((response) =>
+      json<Omit<TokenResponse, "status">>(response).pipe(
+        Effect.map((payload) => ({ status: response.status, ...payload })),
+      ),
+    ),
+  );
+
+/** Registers `registration`, approves it at `access` with a pairing code and exchanges the code. */
+const signIn = (
+  handler: Handler,
+  auth: EnvironmentAuth.EnvironmentAuth["Service"],
+  registration: Record<string, unknown>,
+  access: AuthMcpClientAccess = "auto",
+) =>
+  Effect.gen(function* () {
+    const registered = yield* handler(
+      at("/oauth/mcp/register", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: encodeJson({ redirect_uris: [REDIRECT], ...registration }),
+      }),
+    ).pipe(Effect.flatMap(json<{ client_id: string; grant_types: ReadonlyArray<string> }>));
+    const params = authorizeParams(registered.client_id);
+    const approved = yield* decide(handler, params, {
+      _tag: "pairing-code",
+      access,
+      code: (yield* auth.issuePairingCredential()).credential,
+    });
+    const token = yield* tokenRequest(handler, {
+      grant_type: "authorization_code",
+      code: new URL(approved.redirectTo!).searchParams.get("code")!,
+      redirect_uri: params.redirect_uri,
+      client_id: registered.client_id,
+      code_verifier: verifier,
+      resource: `${ORIGIN}/mcp`,
+    });
+    return { clientId: registered.client_id, grantTypes: registered.grant_types, token };
+  });
+
+const refreshClient = {
+  client_name: "Claude Code",
+  grant_types: ["authorization_code", "refresh_token"],
+};
+
+it.live("renews a client registered for refresh_token with rotating refresh tokens", () =>
+  withRoutes((handler, auth) =>
+    Effect.gen(function* () {
+      const metadata = yield* handler(at("/.well-known/oauth-authorization-server")).pipe(
+        Effect.flatMap(json<{ grant_types_supported: ReadonlyArray<string> }>),
+      );
+      expect(metadata.grant_types_supported).toEqual(["authorization_code", "refresh_token"]);
+
+      const { clientId, grantTypes, token } = yield* signIn(handler, auth, refreshClient, "auto");
+      expect(grantTypes).toEqual(["authorization_code", "refresh_token"]);
+      expect(token).toMatchObject({
+        status: 200,
+        scope: "orchestration:read orchestration:operate",
+      });
+      expect(token.refresh_token).toEqual(expect.any(String));
+      // A refreshing client holds a short access token instead of a 30-day one.
+      expect(token.expires_in).toBeLessThanOrEqual(3_600);
+
+      const refresh = (refreshToken: string, extra: Record<string, string> = {}) =>
+        tokenRequest(handler, {
+          grant_type: "refresh_token",
+          refresh_token: refreshToken,
+          client_id: clientId,
+          ...extra,
+        });
+      const renewed = yield* refresh(token.refresh_token!, {
+        resource: `${ORIGIN}/mcp`,
+        scope: "orchestration:operate orchestration:read",
+      });
+      expect(renewed).toMatchObject({
+        status: 200,
+        scope: "orchestration:read orchestration:operate",
+      });
+      expect(renewed.refresh_token).not.toBe(token.refresh_token);
+      const client = yield* auth.authenticateMcpClient(
+        HttpServerRequest.fromWeb(
+          at("/mcp", { headers: { authorization: `Bearer ${renewed.access_token}` } }),
+        ),
+      );
+      // The renewed token keeps the approved runtime-mode ceiling, not a default.
+      expect(client).toMatchObject({ label: "Claude Code", access: "auto" });
+
+      // A refresh never widens access, and a refused one leaves the token unspent.
+      expect(
+        yield* refresh(renewed.refresh_token!, {
+          scope: "orchestration:read orchestration:operate settings:write",
+        }),
+      ).toMatchObject({ status: 400, error: "invalid_scope" });
+      expect(
+        yield* refresh(renewed.refresh_token!, { resource: "https://other.example/mcp" }),
+      ).toMatchObject({ status: 400, error: "invalid_target" });
+      const viaOtherOrigin = (path: string, init?: RequestInit) =>
+        new Request(`http://127.0.0.1${path}`, {
+          ...init,
+          headers: { host: "other.example", "x-forwarded-proto": "https", ...init?.headers },
+        });
+      expect(
+        yield* tokenRequest(
+          handler,
+          {
+            grant_type: "refresh_token",
+            refresh_token: renewed.refresh_token!,
+            client_id: clientId,
+          },
+          viaOtherOrigin,
+        ),
+      ).toMatchObject({ status: 400, error: "invalid_grant" });
+      const other = yield* signIn(handler, auth, { ...refreshClient, client_name: "Other" });
+      expect(
+        yield* tokenRequest(handler, {
+          grant_type: "refresh_token",
+          refresh_token: renewed.refresh_token!,
+          client_id: other.clientId,
+        }),
+      ).toMatchObject({ status: 400, error: "invalid_grant" });
+
+      const again = yield* refresh(renewed.refresh_token!);
+      expect(again.status).toBe(200);
+
+      // A spent refresh token coming back means it leaked: the whole session ends.
+      expect(yield* refresh(token.refresh_token!)).toMatchObject({
+        status: 400,
+        error: "invalid_grant",
+      });
+      expect((yield* refresh(again.refresh_token!)).status).toBe(400);
+      yield* auth
+        .authenticateMcpClient(
+          HttpServerRequest.fromWeb(
+            at("/mcp", { headers: { authorization: `Bearer ${again.access_token}` } }),
+          ),
+        )
+        .pipe(Effect.flip);
+    }),
+  ),
+);
+
+it.live("ends a refreshing session by revoking its refresh token or the session", () =>
+  withRoutes((handler, auth) =>
+    Effect.gen(function* () {
+      const bearer = (token: string) =>
+        HttpServerRequest.fromWeb(at("/mcp", { headers: { authorization: `Bearer ${token}` } }));
+      const byRefreshToken = yield* signIn(handler, auth, refreshClient);
+      const revoked = yield* handler(
+        at(
+          "/oauth/mcp/revoke",
+          form({ token: byRefreshToken.token.refresh_token!, token_type_hint: "refresh_token" }),
+        ),
+      );
+      expect(revoked.status).toBe(200);
+      yield* auth
+        .authenticateMcpClient(bearer(byRefreshToken.token.access_token!))
+        .pipe(Effect.flip);
+
+      // Settings → Connections revokes the session, and its refresh token goes with it.
+      const bySettings = yield* signIn(handler, auth, refreshClient);
+      const session = yield* auth.authenticateMcpClient(bearer(bySettings.token.access_token!));
+      yield* auth.revokeSession(session.sessionId);
+      expect(
+        yield* tokenRequest(handler, {
+          grant_type: "refresh_token",
+          refresh_token: bySettings.token.refresh_token!,
+          client_id: bySettings.clientId,
+        }),
+      ).toMatchObject({ status: 400, error: "invalid_grant" });
+    }),
+  ),
+);
+
+it.live("keeps the long-lived token for clients and peer links without refresh_token", () =>
+  withRoutes((handler, auth) =>
+    Effect.gen(function* () {
+      const plain = yield* signIn(handler, auth, { client_name: "Script" });
+      expect(plain.grantTypes).toEqual(["authorization_code"]);
+      expect(plain.token.status).toBe(200);
+      expect(plain.token.refresh_token).toBeUndefined();
+      expect(plain.token.expires_in).toBeGreaterThan(29 * 24 * 3_600);
+      expect(
+        yield* tokenRequest(handler, {
+          grant_type: "refresh_token",
+          refresh_token: "anything",
+          client_id: plain.clientId,
+        }),
+      ).toMatchObject({ status: 400, error: "invalid_client" });
+
+      // A peer link renews its session while used; it never gets a second renewal path.
+      const peer = yield* signIn(handler, auth, {
+        ...refreshClient,
+        software_id: MCP_PEER_LINK_SOFTWARE_ID,
+      });
+      expect(peer.grantTypes).toEqual(["authorization_code"]);
+      expect(peer.token.status).toBe(200);
+      expect(peer.token.refresh_token).toBeUndefined();
+    }),
+  ),
+);

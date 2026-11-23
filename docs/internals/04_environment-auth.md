@@ -40,7 +40,11 @@ model.
 - **MCP clients (`mcp-client`) are a separate audience.** Outside agents authenticate on `/mcp` via
   PKCE OAuth ([McpOAuth](../../apps/server/src/auth/McpOAuth.ts)), with stateless client
   registration so unauthenticated callers cannot grow server state. Users grant read-only access or
-  a runtime-mode ceiling rather than raw scopes. Every non-`/mcp` HTTP and WebSocket route rejects
+  a runtime-mode ceiling rather than raw scopes. Clients that register the `refresh_token` grant
+  get one-hour access tokens and a refresh token bound to their client ID and resource; each refresh
+  rotates it and slides the 30-day idle window, and a spent refresh token presented again revokes the
+  session (RFC 9700 §4.14.2), even when the second use is the client's own concurrent retry. Peer
+  links keep their own use-based renewal. Every non-`/mcp` HTTP and WebSocket route rejects
   `mcp-client` sessions (except the read-only thread relay and client-pairing routes restricted to
   [peer links](./05_remote.md#peer-links)). Every MCP tool must statically declare its access level in
   [`McpToolAccess.ts`](../../apps/server/src/mcp/McpToolAccess.ts), and thread-only tools must still

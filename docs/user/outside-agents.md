@@ -184,5 +184,7 @@ result that always includes the thread id.
 ## Remove an agent
 
 Approved agents appear under **Settings → Sharing & access** like other clients.
-Revoke one there to cut off its access immediately. A sign-in lasts 30 days;
-after that the agent asks you to approve it again.
+Revoke one there to cut off its access immediately. An agent that supports
+refresh tokens stays signed in as long as it renews at least once every 30 days.
+Other agents' sign-ins last 30 days; after that the agent asks you to approve it
+again.

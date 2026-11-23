@@ -619,6 +619,122 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("SessionStore.lay
     }).pipe(Effect.provide(Layer.merge(layerSessionStore(), TestClock.layer()))),
   );
 
+  const refreshable = {
+    subject: "mcp-client",
+    method: "bearer-access-token",
+    scopes: ["orchestration:read", "orchestration:operate"],
+    runtimeModeCeiling: "auto",
+    ttl: Duration.hours(1),
+    renewalWindow: Duration.days(30),
+    refreshBinding: "client-a",
+    client: { label: "Claude Code", deviceType: "bot" },
+  } as const;
+  const refreshInput = {
+    binding: "client-a",
+    ttl: Duration.hours(1),
+    renewalWindow: Duration.days(30),
+  } as const;
+
+  it.effect("rotates refresh tokens and keeps the session's scopes and ceiling", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue(refreshable);
+      const first = yield* sessions.refresh(issued.refreshToken!, refreshInput);
+      const second = yield* sessions.refresh(first.refreshToken!, refreshInput);
+      expect(new Set([issued.refreshToken, first.refreshToken, second.refreshToken]).size).toBe(3);
+      const verified = yield* sessions.verify(second.token);
+      expect(verified).toMatchObject({
+        sessionId: issued.sessionId,
+        subject: "mcp-client",
+        scopes: refreshable.scopes,
+        runtimeModeCeiling: "auto",
+      });
+      expect(Option.getOrThrow(yield* sessions.readRefreshToken(second.refreshToken!))).toEqual({
+        sessionId: issued.sessionId,
+        subject: "mcp-client",
+        scopes: refreshable.scopes,
+      });
+    }).pipe(Effect.provide(layerSessionStore())),
+  );
+
+  it.effect("revokes the session when a spent refresh token comes back", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue(refreshable);
+      const rotated = yield* sessions.refresh(issued.refreshToken!, refreshInput);
+      const replayed = yield* Effect.flip(sessions.refresh(issued.refreshToken!, refreshInput));
+      expect(replayed._tag).toBe("RefreshTokenReusedError");
+      // The thief and the client hold different tokens; neither may continue.
+      expect((yield* Effect.flip(sessions.refresh(rotated.refreshToken!, refreshInput)))._tag).toBe(
+        "SessionTokenRevokedError",
+      );
+      expect((yield* Effect.flip(sessions.verify(rotated.token)))._tag).toBe(
+        "SessionTokenRevokedError",
+      );
+    }).pipe(Effect.provide(layerSessionStore())),
+  );
+
+  it.effect("lets only one of two concurrent refreshes with the same token rotate", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue(refreshable);
+      const results = yield* Effect.forEach(
+        [0, 1],
+        () => Effect.result(sessions.refresh(issued.refreshToken!, refreshInput)),
+        { concurrency: "unbounded" },
+      );
+      const succeeded = results.filter((result) => result._tag === "Success");
+      expect(succeeded).toHaveLength(1);
+      expect(results.filter((result) => result._tag === "Failure")).toHaveLength(1);
+      // The second presentation spent an already spent token, so the chain does not fork.
+      expect((yield* Effect.flip(sessions.verify(succeeded[0]!.success.token)))._tag).toBe(
+        "SessionTokenRevokedError",
+      );
+    }).pipe(Effect.provide(layerSessionStore())),
+  );
+
+  it.effect("refuses a refresh token for another binding without spending it", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue(refreshable);
+      const elsewhere = yield* Effect.flip(
+        sessions.refresh(issued.refreshToken!, { ...refreshInput, binding: "client-b" }),
+      );
+      expect(elsewhere._tag).toBe("SessionTokenNotRenewableError");
+      yield* sessions.refresh(issued.refreshToken!, refreshInput);
+    }).pipe(Effect.provide(layerSessionStore())),
+  );
+
+  it.effect("slides the idle window on each refresh and ends a session left idle past it", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue(refreshable);
+      yield* TestClock.adjust(Duration.days(29));
+      const kept = yield* sessions.refresh(issued.refreshToken!, refreshInput);
+      yield* TestClock.adjust(Duration.days(29));
+      const keptAgain = yield* sessions.refresh(kept.refreshToken!, refreshInput);
+      yield* TestClock.adjust(Duration.days(30));
+      expect(
+        (yield* Effect.flip(sessions.refresh(keptAgain.refreshToken!, refreshInput)))._tag,
+      ).toBe("SessionTokenExpiredError");
+    }).pipe(Effect.provide(Layer.merge(layerSessionStore(), TestClock.layer()))),
+  );
+
+  it.effect("refuses access tokens as refresh tokens and refresh tokens as access tokens", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue(refreshable);
+      expect((yield* Effect.flip(sessions.refresh(issued.token, refreshInput)))._tag).toBe(
+        "MalformedSessionTokenError",
+      );
+      expect((yield* Effect.flip(sessions.verify(issued.refreshToken!)))._tag).toBe(
+        "InvalidSessionTokenPayloadError",
+      );
+      const plain = yield* sessions.issue({ subject: "mcp-client", method: "bearer-access-token" });
+      expect(plain.refreshToken).toBeUndefined();
+    }).pipe(Effect.provide(layerSessionStore())),
+  );
+
   it.effect("lists active sessions, tracks connectivity, and revokes other sessions", () =>
     Effect.gen(function* () {
       const sessions = yield* SessionStore.SessionStore;
